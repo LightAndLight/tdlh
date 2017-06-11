@@ -1,125 +1,122 @@
 module Main where
 
-import           Control.Monad.State.Lazy
-import           Data.Char                (isDigit, toLower)
-import           Data.List
-import           System.IO
-import           System.Console.ANSI
+import Control.Monad
+import Control.Monad.State
+import Data.Char 
+import System.Exit
 
-type TodoList = [String]
+data Input = Input String [String]
 
-data Command = Quit
-             | Help
-             | List
-             | Add { item :: Maybe String }
-             | Remove { index :: Maybe Int }
-             | Save { filePath :: Maybe String }
-             | Load { filePath :: Maybe String }
-             deriving (Show, Eq)
+data Command
+  = Quit
+  | Help
+  | List
+  | Add String
+  | Remove Int
+  | Save String
+  | Load String
+  deriving (Show, Eq)
 
--- Splits word when conditions are met
---
-wordsWhen     :: (Char -> Bool) -> String -> [String]
-wordsWhen p s =
-    case dropWhile p s of
-      "" -> []
-      s' -> w : wordsWhen p s''
-            where (w, s'') = break p s'
+data InputError
+  = MissingArgs
+  | NotAnInt String
+  | InvalidCommand String
 
--- Checks if string only contains digits
-strOnlyDigits :: String -> Maybe Int
-strOnlyDigits s = if all isDigit s then Just (read s :: Int) else Nothing
+showInputError :: InputError -> String
+showInputError err =
+  case err of
+    MissingArgs -> "Missing argument"
+    NotAnInt val -> quoted val ++ " is not an integer"
+    InvalidCommand cmd -> quoted cmd ++ " is not a valid command"
+  where
+    quoted str = "'" ++ str ++ "'"
 
--- Maybe Tail
-maybeTail :: String -> Maybe String
-maybeTail s = if null s then Nothing else Just (tail s)
+lineToInput :: String -> Input
+lineToInput line =
+  case separate ':' line of
+    [] -> Input "" []
+    cmd:args -> Input cmd args
+  where
+    separate :: Eq a => a -> [a] -> [[a]]
+    separate sep [] = []
+    separate sep input =
+      let (chunk, rest) = break (==sep) input
+          toPrepend =
+            case chunk of
+              [] -> []
+              _ -> [chunk]
+      in case rest of
+        [] -> toPrepend
+        (_:rest) -> toPrepend ++ separate sep rest
 
--- Tokenize input
-tokenize :: String -> Maybe Command
-tokenize s = cmd'
-    where (cmd, args) = break (==':') s
-          -- Gets rid of the colon (if any)
-          args' = maybeTail args
-          cmd' = case map toLower cmd of
-                   "quit"   -> Just Quit
-                   "help"   -> Just Help
-                   "remove" -> Just Remove { index = args' >>= strOnlyDigits }
-                   "add"    -> Just Add { item = args' }
-                   "list"   -> Just List
-                   "save"   -> Just Save { filePath = args' }
-                   "load"   -> Just Load { filePath = args' }
-                   _        -> Nothing
+inputToCommand :: Input -> Either InputError Command
+inputToCommand (Input cmd args) =
+  case fmap toLower cmd of
+    "quit" -> Right Quit
+    "help" -> Right Help
+    "list" -> Right List
+    "add" -> withNArgs 1 args $ \[message] -> Right $ Add message
+    "remove" -> withNArgs 1 args $ \[ix] ->
+      if all isDigit ix
+        then Right . Remove $ read ix
+        else Left $ NotAnInt ix
+    "save" -> withNArgs 1 args $ \[path] -> Right $ Save path
+    "load" -> withNArgs 1 args $ \[path] -> Right $ Load path
+    cmd -> Left $ InvalidCommand cmd
+  where
+    withNArgs :: Int -> [a] -> ([a] -> Either InputError r) -> Either InputError r
+    withNArgs 0 xs f = f xs
+    withNArgs n xs f =
+      case take n xs of
+        [] -> Left MissingArgs
+        xs' -> f xs'
 
--- Removes index from todolist
-rmTDLItem :: Int -> TodoList -> TodoList
-rmTDLItem i x = take i x ++ drop (i+1) x
+helpMessage :: String
+helpMessage = unlines
+  [ "Commands:"
+  , ""
+  , "quit - Exit the program"
+  , "help - Display this message"
+  , "list - Display the list"
+  , "add:<string> - Adds a message to the list"
+  , "remove:<int> - Removes the element at the specified position"
+  , "save:<filepath> - Save the list to the specified file"
+  , "load:<filepath> - Load a list from the specified file"
+  ]
 
--- TodoList to String
---
-tdl2Str :: Int -> TodoList -> String
-tdl2Str i [] = []
-tdl2Str i x = if null x' then tdl2Str i xs' else (show i ++ ": " ++ x' ++ "\n") ++ tdl2Str (i + 1) xs'
-    where x'  = head x
-          xs' = tail x
+showTodos :: [String] -> String
+showTodos [] = "List is empty"
+showTodos xs = unlines . fmap (\(n,x) -> show n ++ ": " ++ x) $ zip [0..] xs
 
--- Prompt User correct command
---
-promptCorrectCommand :: String -> IO ()
-promptCorrectCommand s = putStrLn $ "Command needs to be in format " ++ s ++ ""
+runCommand :: Command -> StateT [String] IO ()
+runCommand Quit = liftIO exitSuccess
+runCommand Help = liftIO $ putStrLn helpMessage
+runCommand List = do
+  list <- get
+  liftIO . putStrLn $ showTodos list 
+runCommand (Add message) = modify (++[message])
+runCommand (Remove ix) = modify (removeAt ix)
+  where
+    removeAt _ [] = []
+    removeAt 0 (_:xs) = xs
+    removeAt n (x:xs) = x : removeAt (n-1) xs
+runCommand (Save path) = do
+  list <- get
+  liftIO . writeFile path $ unlines list
+runCommand (Load path) = do
+  list <- fmap lines . liftIO $ readFile path
+  put list
 
+program = do
+  input <- liftIO getLine
+  unless (null input) $ do
+    liftIO $ putStrLn ""
+    case inputToCommand $ lineToInput input of
+      Right cmd -> runCommand cmd
+      Left err ->
+        liftIO $ do
+          putStrLn $ showInputError err
+          putStrLn "Type 'help' to see available commands\n"
+  program
 
--- Indefinitely queries until
--- user types 'quit'
-indefiniteParse :: StateT TodoList IO ()
-indefiniteParse = do
-    -- Gets the previous todo list
-    tdl <- get
-
-    -- Gets user input
-    c <- liftIO getLine
-
-    -- Clears screen
-    -- sets cursor to 0,0
-    liftIO clearScreen
-    liftIO $ setCursorPosition 0 0
-
-    case tokenize c of
-      (Just Quit)       -> return ()
-      (Just List)       -> liftIO $ putStrLn (tdl2Str 0 tdl)
-      (Just (Remove i)) -> case i of
-                             Nothing   -> liftIO $ promptCorrectCommand "`remove:<index>`"
-                             (Just i') -> do put $ rmTDLItem i' tdl
-                                             liftIO $ putStrLn $ "removed item: " ++ show i'
-      (Just (Add s))    -> case s of
-                             Nothing   -> liftIO $ promptCorrectCommand "`add:<string>`"
-                             (Just s') -> do put $ tdl ++ [s']
-                                             liftIO $ putStrLn $ "added item: " ++ s'
-      (Just (Save s))   -> case s of
-                             Nothing   -> liftIO $ promptCorrectCommand "`save:<filepath>`"
-                             (Just s') -> do liftIO $ writeFile s' (intercalate "\n" tdl)
-                                             liftIO $ putStrLn $ "saved file to: " ++ s'
-      (Just (Load s))   -> case s of
-                             Nothing   -> liftIO $ promptCorrectCommand "`load:<filepath>`"
-                             (Just s') -> do tdl' <- liftIO $ readFile s'
-                                             put $ wordsWhen (=='\n') tdl'
-      (Just Help)       -> do liftIO $ putStrLn "quit"
-                              liftIO $ putStrLn "help"
-                              liftIO $ putStrLn "remove:<index>"
-                              liftIO $ putStrLn "add:<string>"
-                              liftIO $ putStrLn "list"
-                              liftIO $ putStrLn "save:<filepath>"
-                              liftIO $ putStrLn "load:<filepath>"
-      Nothing           -> liftIO $ putStrLn "Unrecognized command, type help for more info"
-
-    if tokenize c == Just Quit then return () else indefiniteParse
-
-main :: IO ()
-main = do
-    -- Clear screen and allow
-    -- the use of arrow keys
-    -- and backspace
-    hSetBuffering stdin LineBuffering
-    clearScreen
-    setCursorPosition 0 0
-    putStrLn "--- Welcome to Todo List, in Haskell v0.0.1, type 'help' for help ---"
-    void $ runStateT indefiniteParse ([""] :: TodoList)
+main = runStateT program []
